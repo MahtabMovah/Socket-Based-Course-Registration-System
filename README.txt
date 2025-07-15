@@ -67,5 +67,4 @@ d. (1)client.cpp: connects to the serverM via a TCP port. It inputs username and
    g++ -std=c++11 -o serverCS serverCS.cpp
    g++ -std=c++11 -o serverEE serverEE.cpp
 
-
-h. I used https://beej.us/guide/bgnet/html/ for socket programming and https://stackoverflow.com/questions/1474790/how-to-read-write-into-from-text-file-with-comma-separated-values for reading the txt files
+I used https://beej.us/guide/bgnet/html/ for socket programming and https://stackoverflow.com/questions/1474790/how-to-read-write-into-from-text-file-with-comma-separated-values for reading the txt files
