@@ -1,7 +1,7 @@
-a.Name: Mahtab Movahhedrad
 
+Socket-Based-Course-Registration-System
 
-c. In this project, the client prompts the user for a username and password, then sends them to ServerM over a TCP connection. ServerM encrypts the credentials and forwards them via UDP to ServerC, which checks its database and returns a confirmation message if they match. The client has up to three attempts to enter the correct username and password. Once authenticated, ServerM notifies the client, then asks for a course code and query category. The client sends this information over TCP to ServerM, which forwards the request via UDP to either ServerCS or ServerEE based on the course code. The department server looks up the requested data in its database and replies via UDP to ServerM, which then relays the response back to the client over TCP and waits for the next query.
+In this project, the client prompts the user for a username and password, then sends them to ServerM over a TCP connection. ServerM encrypts the credentials and forwards them via UDP to ServerC, which checks its database and returns a confirmation message if they match. The client has up to three attempts to enter the correct username and password. Once authenticated, ServerM notifies the client, then asks for a course code and query category. The client sends this information over TCP to ServerM, which forwards the request via UDP to either ServerCS or ServerEE based on the course code. The department server looks up the requested data in its database and replies via UDP to ServerM, which then relays the response back to the client over TCP and waits for the next query.
 d. (1)client.cpp: connects to the serverM via a TCP port. It inputs username and password and waits for auth response. Then after receiving the conformation, it enters the coursecode and query category and server main will respod to that via the TCP port. 
 
 
