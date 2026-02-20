@@ -1,199 +1,191 @@
-#include <stdio.h>
-#include <stdlib.h>
-#include <unistd.h>
-#include <errno.h>
-#include <string.h>
+/**
+ * @file serverC.cpp
+ * @brief Authentication server (ServerC).
+ *
+ * Listens on a UDP socket for (username, password) pairs forwarded by the
+ * main server, validates them against a comma-separated credential file
+ * ("cred.txt"), and replies with a result token:
+ *
+ *   "TT" — username and password both match
+ *   "T"  — password matches but username does not
+ *   "F"  — neither matches
+ *
+ * Build:  g++ -std=c++17 -Wall -Wextra -o serverC serverC.cpp
+ * Usage:  ./serverC
+ */
+
+#include <arpa/inet.h>
 #include <netdb.h>
-#include <sys/types.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
-#include <arpa/inet.h>
-#include <sys/wait.h>
-#include <string>
-#include <fstream>
-#include <algorithm>
-#include <vector>
+#include <sys/types.h>
+#include <unistd.h>
+
+#include <cerrno>
 #include <cstring>
-#include <iostream>
 #include <fstream>
+#include <iostream>
 #include <string>
 #include <vector>
-#include <stdio.h>
-#include <string.h>
-#include <sstream>
-#include <algorithm>
-#include <vector>
-#include <iostream>
-#include <fstream>
-#include <string>
-#include <vector>
-#include <sstream>
-#include<string.h>
-#include <iostream>
-#include <fstream>
-#include <string>
-#include <iomanip>
-const unsigned int ArraySizeDef = 90;
-using namespace std;
 
-#define localhost "127.0.0.1" //localhost address
-#define SERVERAUTH 21289 
-#define MAINUDPPort 24289 
-#define MAXDATARECV 51 
-char enc_user[MAXDATARECV];
-char enc_pass[MAXDATARECV];
-struct sockaddr_in central_Address; 
-socklen_t central_size; 
+// ─── Configuration ────────────────────────────────────────────────────────────
 
-std::string line; 
+static constexpr const char* SERVER_IP       = "127.0.0.1";
+static constexpr uint16_t    AUTH_UDP_PORT   = 21289;   // this server's port
+static constexpr uint16_t    MAIN_UDP_PORT   = 24289;   // main server's port
+static constexpr size_t      RECV_BUF_SIZE   = 51;
+static constexpr const char* CREDENTIAL_FILE = "cred.txt";
 
-struct sockaddr_in addr_auth; 
+// ─── Auth result tokens (must match main server & client) ─────────────────────
 
-string result; //
-int sockfd_UDP;
-struct sockaddr_in UDPaddr; //address of serverT UDP
+static constexpr const char* AUTH_OK        = "TT";  // user + pass match
+static constexpr const char* AUTH_PASS_ONLY = "T";   // pass match, wrong user
+static constexpr const char* AUTH_FAIL      = "F";   // no match
 
+// ─── Data model ───────────────────────────────────────────────────────────────
 
-void initializeSocket() {
-    sockfd_UDP = socket(PF_INET, SOCK_DGRAM, 0);
-    if (sockfd_UDP == -1) {
-        perror("Server UDP Socket Failed!");
-        exit(1);
-    }
-    memset(UDPaddr.sin_zero, '\0', sizeof  UDPaddr.sin_zero);
-    UDPaddr.sin_family = AF_INET;
-    UDPaddr.sin_port = htons(SERVERAUTH);
-    UDPaddr.sin_addr.s_addr = inet_addr(localhost);
-    if(::bind(sockfd_UDP, (struct sockaddr*) &UDPaddr, sizeof(UDPaddr)) == -1) {
-        perror("Server UDP Bind Failed!");
-        exit(1);
-    }
-    printf("The ServerC is up and running using UDP on port %d.\n", SERVERAUTH);
-}
-
-
-
-
-struct Data {
-    std::string user;
-    std::string ID;
+struct Credential {
+    std::string username;
+    std::string password;
 };
 
+// ─── Credential loading ───────────────────────────────────────────────────────
+
+/**
+ * @brief Load credentials from a CSV file (format: "username,password\n").
+ *
+ * Trailing whitespace on the password field is stripped automatically by
+ * using std::ws after the comma.
+ *
+ * @param path Path to the credential file.
+ * @return Vector of Credential structs; empty on error.
+ */
+static std::vector<Credential> loadCredentials(const std::string& path) {
+    std::vector<Credential> creds;
+    std::ifstream ifs(path);
+
+    if (!ifs.is_open()) {
+        std::cerr << "Error: could not open credential file: " << path << "\n";
+        return creds;
+    }
+
+    Credential entry;
+    while (std::getline(std::getline(ifs, entry.username, ',') >> std::ws,
+                        entry.password)) {
+        creds.push_back(entry);
+    }
+
+    return creds;
+}
+
+// ─── Authentication logic ─────────────────────────────────────────────────────
+
+/**
+ * @brief Check a username/password pair against the loaded credentials.
+ *
+ * @param creds    Credential list loaded from file.
+ * @param username Received (possibly encoded) username.
+ * @param password Received (possibly encoded) password.
+ * @return One of: AUTH_OK, AUTH_PASS_ONLY, or AUTH_FAIL.
+ */
+static const char* authenticate(const std::vector<Credential>& creds,
+                                const std::string& username,
+                                const std::string& password) {
+    for (const auto& c : creds) {
+        if (c.password == password) {
+            return (c.username == username) ? AUTH_OK : AUTH_PASS_ONLY;
+        }
+    }
+    return AUTH_FAIL;
+}
+
+// ─── Socket initialisation ────────────────────────────────────────────────────
+
+/**
+ * @brief Create and bind a UDP socket on AUTH_UDP_PORT.
+ * @return Bound socket file descriptor, or -1 on failure.
+ */
+static int createAndBind() {
+    int fd = ::socket(PF_INET, SOCK_DGRAM, 0);
+    if (fd == -1) {
+        ::perror("socket");
+        return -1;
+    }
+
+    sockaddr_in addr{};
+    addr.sin_family      = AF_INET;
+    addr.sin_port        = htons(AUTH_UDP_PORT);
+    addr.sin_addr.s_addr = ::inet_addr(SERVER_IP);
+
+    if (::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == -1) {
+        ::perror("bind");
+        ::close(fd);
+        return -1;
+    }
+
+    return fd;
+}
+
+// ─── Entry point ──────────────────────────────────────────────────────────────
+
 int main() {
-    //initialization
+    int fd = createAndBind();
+    if (fd == -1) return 1;
 
-    initializeSocket();
+    std::cout << "The ServerC is up and running using UDP on port "
+              << AUTH_UDP_PORT << ".\n";
+
+    // Pre-configure the main server's address (reply target)
+    sockaddr_in mainAddr{};
+    mainAddr.sin_family      = AF_INET;
+    mainAddr.sin_port        = htons(MAIN_UDP_PORT);
+    mainAddr.sin_addr.s_addr = ::inet_addr(SERVER_IP);
+
+    char userBuf[RECV_BUF_SIZE];
+    char passBuf[RECV_BUF_SIZE];
+
     while (true) {
-        central_size = sizeof(central_Address);
-        int bytes_user;
-        int bytes_pass;
-        //receive input from serverC
-        // source Beej's guide: https://beej.us/guide/bgnet/html/
-        memset(addr_auth.sin_zero, '\0', sizeof  addr_auth.sin_zero);
-        addr_auth.sin_family = AF_INET;
-        addr_auth.sin_port = htons(MAINUDPPort);
-        addr_auth.sin_addr.s_addr = inet_addr(localhost);
+        sockaddr_in senderAddr{};
+        socklen_t   senderLen = sizeof(senderAddr);
 
-
-
-        if ((bytes_user = recvfrom(sockfd_UDP, enc_user, sizeof(enc_user), 0, (struct sockaddr *)&central_Address, &central_size)) == -1) {
-            perror("Receive From Central Server Failed!");
-            exit(1);
+        // ── Receive username ──────────────────────────────────────────────────
+        ssize_t n = ::recvfrom(fd, userBuf, RECV_BUF_SIZE - 1, 0,
+                               reinterpret_cast<sockaddr*>(&senderAddr),
+                               &senderLen);
+        if (n == -1) {
+            ::perror("recvfrom (username)");
+            break;
         }
-        enc_user[bytes_user] = '\0';
-      //  printf("The ServerT received a request from Central to get the topology %s talash .\n", enc_user);
-        if ((bytes_pass = recvfrom(sockfd_UDP, enc_pass, sizeof(enc_pass), 0, (struct sockaddr *)&central_Address, &central_size)) == -1) {
-            perror("Receive From Central Server Failed!");
-            exit(1);
+        userBuf[n] = '\0';
+
+        // ── Receive password ──────────────────────────────────────────────────
+        n = ::recvfrom(fd, passBuf, RECV_BUF_SIZE - 1, 0,
+                       reinterpret_cast<sockaddr*>(&senderAddr),
+                       &senderLen);
+        if (n == -1) {
+            ::perror("recvfrom (password)");
+            break;
         }
-        enc_pass[bytes_pass] = '\0';
-        cout<<"The ServerC received an authentication request from the Main Server. "<<endl;
-    ////////////////////////read the cred.txt file//////////////////////////////////////////////
- /*   vector<vector<string> > content;
-    vector<string> row;
-    string line, word;
+        passBuf[n] = '\0';
 
-    fstream file ("cred.txt", ios::in);
-    if(file.is_open())
-    {
-    while(getline(file, line))
-    {
-    row.clear();
+        std::cout << "The ServerC received an authentication request "
+                     "from the Main Server.\n";
 
-    else
+        // ── Load credentials & authenticate ───────────────────────────────────
+        std::vector<Credential> creds = loadCredentials(CREDENTIAL_FILE);
+        const char* result = authenticate(creds, userBuf, passBuf);
 
-            }
-////////////////////////////////////////////////////////////////
-    
-*/
-//    cout<<"enc_pass ke encode kardam ineeee="<<enc_pass;
-    string enc_passs(enc_pass);
-    result="F";  
-
-    // Define array for our needed data
-    Data data[ArraySizeDef];
-
-    // Open the file and check, if it could be opened
-    std::ifstream ifs("cred.txt");
-    if (ifs.is_open()) {
-
-        unsigned int index = 0;
-        // Read all lines and put result into arrays
-        while ((index < ArraySizeDef) and 
-            (std::getline(std::getline(ifs, data[index].user, ',') >> std::ws, data[index].ID))) {
-            // Now we have read a comlete line. Goto next index
-            ++index;
+        // ── Reply to main server ──────────────────────────────────────────────
+        if (::sendto(fd, result, std::strlen(result), 0,
+                     reinterpret_cast<sockaddr*>(&mainAddr),
+                     sizeof(mainAddr)) == -1) {
+            ::perror("sendto");
+            break;
         }
-        // Show debug output
-        for (unsigned int i = 0; i < index; ++i)
-          { // std::cout << "User: " << data[i].user << "\tID: " << data[i].ID<< '\n';
-          //  printf("ans was= %s " , data[0].ID);
-         //   printf("ans shao= %s ", data[0].ID.erase((data[0].ID.size())-1));
-             }
-          
 
-  //      cout<<"sizeofpassenc: "<<enc_passs.size()<<" suzeofextracted: "<<data[0].ID.size()<<"extracted val : "<< data[0].ID;
-        for (int xs=0; xs<index ;xs++){
-            
-        if((data[xs].ID.substr(0, data[xs].ID.size() - 1))==enc_passs)
-            {//cout<<"huraaaaa pass !!"<< endl;
-            result="T";
-            if(data[xs].user==enc_user){
-                result="TT";
-             }
-            }
-
-            
-
-        }
-        
+        std::cout << "The ServerC finished sending the response to the Main Server.\n\n";
     }
-    else
-        {std::cout << "\n\n*** Error: Could not open source file\n\n";}
 
-
-
-    
-
-
-////////////////////////////////////////////////////////////////            
-
-
-
-
-    
-        if (sendto(sockfd_UDP, result.data(), result.size(), 0, (struct sockaddr *) &addr_auth, sizeof(addr_auth)) == -1) {
-            perror("Send Data to server Central Failed!");
-            exit(1);
-        }
-    cout<<" The ServerC finished sending the response to the Main Server. "<< endl;
-   // cout<< result << endl;
-    }
-  
-
-
-
-    // source Beej's guide: https://beej.us/guide/bgnet/html/
-    close(sockfd_UDP);
+    ::close(fd);
     return 0;
 }
