@@ -1,188 +1,212 @@
-#include <stdio.h>
-#include <stdlib.h>
-#include <unistd.h>
-#include <errno.h>
-#include <string.h>
-#include <netdb.h>
-#include <sys/types.h>
+/**
+ * @file serverEE.cpp
+ * @brief EE department course-query server (ServerEE).
+ *
+ * Listens on a UDP socket for (course_code, category) query pairs forwarded
+ * by the main server, looks up the answer in "ee.txt", and replies with the
+ * result (or a descriptive error message).
+ *
+ * ee.txt format (one course per line):
+ *   code,credit,professor,days,courseName
+ *
+ * Category tokens accepted: Credit | Professor | Days | CourseName
+ *
+ * Build:  g++ -std=c++17 -Wall -Wextra -o serverEE serverEE.cpp
+ * Usage:  ./serverEE
+ *
+ * NOTE: This server shares identical logic with serverCS.cpp — only the port
+ * number (EE_UDP_PORT) and data file (COURSE_FILE) differ. Consider extracting
+ * the shared code into a common "course_server_lib" in a future refactor.
+ */
+
+#include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
-#include <arpa/inet.h>
-#include <sys/wait.h>
-#include <string>
-#include <set>
-#include <algorithm>
-#include <vector>
-#include <limits>
-#include <queue>
-#include <cmath>
-#include <iostream>
-#include <iostream>
+#include <sys/types.h>
+#include <unistd.h>
+
+#include <cerrno>
+#include <cstring>
 #include <fstream>
+#include <iostream>
 #include <sstream>
 #include <string>
-#include<vector>
-#include <list>
-using namespace std;
+#include <vector>
 
-#define localhost "127.0.0.1" //localhost address
-#define serCSudp 23289 
-#define MainUdpPort 24289 
-#define SizeOfDATA 40000 
-int sockfd_UDP; 
-struct sockaddr_in UDPaddr;
-struct sockaddr_in central_Address;
-socklen_t central_size;
-char EE_code[SizeOfDATA]; 
-char CS_q[SizeOfDATA];
+// ─── Configuration ────────────────────────────────────────────────────────────
 
-char INPbuff[SizeOfDATA]; 
-char INPbuffs[SizeOfDATA];
+static constexpr const char* SERVER_IP     = "127.0.0.1";
+static constexpr uint16_t    EE_UDP_PORT   = 23289;   // this server's port
+static constexpr uint16_t    MAIN_UDP_PORT = 24289;   // main server's port
+static constexpr size_t      RECV_BUF_SIZE = 40000;
+static constexpr const char* COURSE_FILE   = "ee.txt";
 
+// ─── Data model ───────────────────────────────────────────────────────────────
 
-struct sockaddr_in address_C;
+struct Course {
+    std::string code;
+    std::string credit;
+    std::string professor;
+    std::string days;
+    std::string name;
+};
 
+// ─── Course loading ───────────────────────────────────────────────────────────
 
+/**
+ * @brief Load courses from a CSV file.
+ *
+ * Expected format per line: code,credit,professor,days,courseName
+ *
+ * @param path Path to the course data file.
+ * @return Vector of Course structs; empty on error.
+ */
+static std::vector<Course> loadCourses(const std::string& path) {
+    std::vector<Course> courses;
+    std::ifstream ifs(path);
 
-void initializeSocket() {
-    sockfd_UDP = socket(PF_INET, SOCK_DGRAM, 0);
-    if (sockfd_UDP == -1) {
-        perror("Server UDP Socket Failed!");
-        exit(1);
+    if (!ifs.is_open()) {
+        std::cerr << "Error: could not open course file: " << path << "\n";
+        return courses;
     }
-    memset(UDPaddr.sin_zero, '\0', sizeof  UDPaddr.sin_zero);
-    UDPaddr.sin_family = AF_INET;
-    UDPaddr.sin_port = htons(serCSudp);
-    UDPaddr.sin_addr.s_addr = inet_addr(localhost);
-    if(::bind(sockfd_UDP, (struct sockaddr*) &UDPaddr, sizeof(UDPaddr)) == -1) {
-        perror("Server UDP Bind Failed!");
-        exit(1);
+
+    std::string line;
+    while (std::getline(ifs, line)) {
+        if (line.empty()) continue;
+
+        std::istringstream ss(line);
+        Course c;
+        std::getline(ss, c.code,      ',');
+        std::getline(ss, c.credit,    ',');
+        std::getline(ss, c.professor, ',');
+        std::getline(ss, c.days,      ',');
+        std::getline(ss, c.name,      ',');
+        courses.push_back(std::move(c));
     }
-    printf("The ServerEE is up and running using UDP on port %d.\n", serCSudp);
+
+    return courses;
 }
 
+// ─── Query resolution ─────────────────────────────────────────────────────────
 
+/**
+ * @brief Look up a specific field for a given course code.
+ *
+ * @param courses  Loaded course list.
+ * @param code     Course code to find.
+ * @param category Field to retrieve: "Credit", "Professor", "Days", or "CourseName".
+ * @return The requested field value, or a descriptive error string.
+ */
+static std::string resolveQuery(const std::vector<Course>& courses,
+                                const std::string& code,
+                                const std::string& category) {
+    for (const auto& c : courses) {
+        if (c.code != code) continue;
 
-int main() {
-    //initialize socket
-    initializeSocket();
-    while (true) {
-        central_size = sizeof(central_Address);
-        ifstream myfile("ee.txt");
-        if(!myfile.is_open()){
-        cout<<"failed"<<endl;
-        return 0;
-        }
-        string code,cred,prof,date,location;
-        string myStr;
-        string line;
-        std::vector<string> ccodes,credits,profess,days,namec;
-        while(getline(myfile,line)){
-        stringstream ss(line);
-        getline(ss,code,',');
-        getline(ss,cred,',');
-        getline(ss,prof,',');
-        getline(ss,date,',');
-        getline(ss,location,',');
-        ccodes.push_back(code);
-        credits.push_back(cred);
-        days.push_back(date);
-        namec.push_back(location);
-        profess.push_back(prof);
+        if (category == "Credit")     return c.credit;
+        if (category == "Professor")  return c.professor;
+        if (category == "Days")       return c.days;
+        if (category == "CourseName") return c.name;
 
-        }
-
-
-        //get clientA input from central
-        // source Beej's guide: https://beej.us/guide/bgnet/html/
-        int bytesReceived;
-        if ((bytesReceived = recvfrom(sockfd_UDP, EE_code, sizeof(EE_code), 0, (struct sockaddr *)&central_Address, &central_size)) == -1) {
-            perror("Receive From Central Server Failed!");
-            exit(1);
-        }
-      //  EE_code[bytesReceived] = '\0';
-
-     //   printf("code reveived: %s",EE_code);
-        // cout<<EE_code<<endl;
-        int bytesReceivedq;
-        if ((bytesReceivedq = recvfrom(sockfd_UDP, CS_q, sizeof(CS_q), 0, (struct sockaddr *)&central_Address, &central_size)) == -1) {
-            perror("Receive From Central Server Failed!");
-            exit(1);
-        }
-        CS_q[bytesReceivedq] = '\0';
-        printf("The ServerEE received a request from the Main Server about the %s of %s.", CS_q,EE_code);
-        string CS_qq(CS_q);
-     //   printf("code reveived: %s",CS_q);
-     //   cout<<CS_q<<endl;
-        char res_code='A';
-        memset(address_C.sin_zero, '\0', sizeof  address_C.sin_zero);
-        address_C.sin_family = AF_INET;
-        address_C.sin_port = htons(MainUdpPort);
-        address_C.sin_addr.s_addr = inet_addr(localhost);
-        char Credits[7]="Credit";
-        char Professor[10]="Professor";
-        char Days[5]="Days";
-        char CourseName[11]="CourseName";
-        string quer_point="F";
-        string quer_disc="Didn’t find the course: ";
-        string course_point="F";
-        string course_disc="Didn’t find the course: ";
-
- 
-
-        for (int ix=0;ix<ccodes.size();ix++){ 
-            if(ccodes[ix]==EE_code){int row=ix;course_point="X";
-
-            if (CS_qq==Credits ){quer_point="X";
-                cout<<"The course information has been found: The Credits of "<< EE_code<<" is "<<credits[row]<<endl;
-                if (sendto(sockfd_UDP,credits[row].data(), credits[row].size(), 0, (struct sockaddr *) &address_C, sizeof(address_C)) == -1) {
-                perror("Send Data to server Central Failed!");
-                exit(1);
-            }
-          //  printf("The course information has been found: The <category> of <course code> is <information>.")
-        }
-        else if (CS_qq==Professor){quer_point="X";
-             cout<<"The course information has been found: The Professor of "<< EE_code<<" is "<<profess[row]<<endl;
-            if (sendto(sockfd_UDP,profess[row].data(), profess[row].size(), 0, (struct sockaddr *) &address_C, sizeof(address_C)) == -1) {
-                perror("Send Data to server Central Failed!");
-                exit(1);}
-            
-        }
-        else if (CS_qq==Days){quer_point="X";
-             cout<<"The course information has been found: The Days of "<< EE_code<<" is "<<Days[row]<<endl;
-            if (sendto(sockfd_UDP,days[row].data(), days[row].size(), 0, (struct sockaddr *) &address_C, sizeof(address_C)) == -1) {
-                perror("Send Data to server Central Failed!");
-                exit(1);}
-        }
-        else if (CS_qq==CourseName){quer_point="X";
-             cout<<"The course information has been found: The CourseNme of "<< EE_code<<" is "<<namec[row]<<endl;
-            if (sendto(sockfd_UDP,namec[row].data(), namec[row].size(), 0, (struct sockaddr *) &address_C, sizeof(address_C)) == -1) {
-                perror("Send Data to server Central Failed!");
-                exit(1);}
-        }
-            
-             }
-
-         }
-         cout<<"The ServerEE finished sending the response to the Main Server."<<endl;
-        if (quer_point=="F"){   
-            if (sendto(sockfd_UDP,quer_disc.data(), quer_disc.size(), 0, (struct sockaddr *) &address_C, sizeof(address_C)) == -1) {
-                perror("Send Data to server Central Failed!");
-                exit(1);}
-        }
-                if (course_point=="F"){ printf("Didn’t find the course: %s .\n.",EE_code);  
-            if (sendto(sockfd_UDP,course_disc.data(), course_disc.size(), 0, (struct sockaddr *) &address_C, sizeof(address_C)) == -1) {
-                perror("Send Data to server Central Failed!");
-                exit(1);}
-        }
-
-
-
-
-    // Open the file and check, if it could be opened
-
+        return "Error: unknown category \"" + category + "\"";
     }
 
-    close(sockfd_UDP);
+    return "Didn't find the course: " + code;
+}
+
+// ─── Socket initialisation ────────────────────────────────────────────────────
+
+/**
+ * @brief Create and bind a UDP socket on EE_UDP_PORT.
+ * @return Bound socket file descriptor, or -1 on failure.
+ */
+static int createAndBind() {
+    int fd = ::socket(PF_INET, SOCK_DGRAM, 0);
+    if (fd == -1) {
+        ::perror("socket");
+        return -1;
+    }
+
+    sockaddr_in addr{};
+    addr.sin_family      = AF_INET;
+    addr.sin_port        = htons(EE_UDP_PORT);
+    addr.sin_addr.s_addr = ::inet_addr(SERVER_IP);
+
+    if (::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == -1) {
+        ::perror("bind");
+        ::close(fd);
+        return -1;
+    }
+
+    return fd;
+}
+
+// ─── Entry point ──────────────────────────────────────────────────────────────
+
+int main() {
+    int fd = createAndBind();
+    if (fd == -1) return 1;
+
+    std::cout << "The ServerEE is up and running using UDP on port "
+              << EE_UDP_PORT << ".\n";
+
+    // Pre-configure the main server's reply address
+    sockaddr_in mainAddr{};
+    mainAddr.sin_family      = AF_INET;
+    mainAddr.sin_port        = htons(MAIN_UDP_PORT);
+    mainAddr.sin_addr.s_addr = ::inet_addr(SERVER_IP);
+
+    char codeBuf[RECV_BUF_SIZE];
+    char categoryBuf[RECV_BUF_SIZE];
+
+    while (true) {
+        sockaddr_in senderAddr{};
+        socklen_t   senderLen = sizeof(senderAddr);
+
+        // ── Receive course code ───────────────────────────────────────────────
+        ssize_t n = ::recvfrom(fd, codeBuf, RECV_BUF_SIZE - 1, 0,
+                               reinterpret_cast<sockaddr*>(&senderAddr),
+                               &senderLen);
+        if (n == -1) {
+            ::perror("recvfrom (course code)");
+            break;
+        }
+        codeBuf[n] = '\0';
+
+        // ── Receive category ──────────────────────────────────────────────────
+        n = ::recvfrom(fd, categoryBuf, RECV_BUF_SIZE - 1, 0,
+                       reinterpret_cast<sockaddr*>(&senderAddr),
+                       &senderLen);
+        if (n == -1) {
+            ::perror("recvfrom (category)");
+            break;
+        }
+        categoryBuf[n] = '\0';
+
+        std::string code(codeBuf);
+        std::string category(categoryBuf);
+
+        std::cout << "The ServerEE received a request from the Main Server "
+                     "about the " << category << " of " << code << ".\n";
+
+        // ── Load courses and resolve the query ────────────────────────────────
+        std::vector<Course> courses = loadCourses(COURSE_FILE);
+        std::string result = resolveQuery(courses, code, category);
+
+        std::cout << "The course information has been found: The "
+                  << category << " of " << code << " is " << result << ".\n";
+
+        // ── Send result to main server ────────────────────────────────────────
+        if (::sendto(fd, result.data(), result.size(), 0,
+                     reinterpret_cast<sockaddr*>(&mainAddr),
+                     sizeof(mainAddr)) == -1) {
+            ::perror("sendto");
+            break;
+        }
+
+        std::cout << "The ServerEE finished sending the response to the Main Server.\n\n";
+    }
+
+    ::close(fd);
     return 0;
 }
